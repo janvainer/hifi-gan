@@ -4,11 +4,63 @@ import random
 import torch
 import torch.utils.data
 import numpy as np
+import librosa
 from librosa.util import normalize
 from scipy.io.wavfile import read
 from librosa.filters import mel as librosa_mel_fn
 
 MAX_WAV_VALUE = 32768.0
+
+
+class MelSpectrogram(torch.nn.Module):
+    def __init__(
+        self,
+        sample_rate=22050,
+        n_fft=1024,
+        hop_length=256,
+        win_length=1024,
+        window=torch.hann_window,
+        n_mels=80,
+        f_min=80,
+        f_max=7600,
+        eps=1e-10,
+    ):
+        super().__init__()
+        self.eps = eps
+        self.f_min = 0 if f_min is None else f_min
+        self.f_max = sample_rate / 2 if f_max is None else f_max
+        self.n_mels = n_mels
+        self.win_length = win_length
+        self.hop_length = hop_length
+        self.n_fft = n_fft
+        self.sample_rate = sample_rate
+
+        self.register_buffer('window', window(win_length))
+        self.register_buffer(
+            'mel_basis',
+            torch.from_numpy(
+                librosa.filters.mel(
+                    self.sample_rate, self.n_fft, self.n_mels, self.f_min, self.f_max
+                ).T
+            )
+        )
+
+    def forward(self, x):
+        # (batch × n_fft × time × 2)
+        x_stft = (
+            torch.stft(
+                x,
+                n_fft=self.n_fft,
+                hop_length=self.hop_length,
+                win_length=self.win_length,
+                window=self.window,
+                pad_mode="reflect",
+            )
+            ** 2
+        )
+        # (batch × n_fft × time)
+        spc = (x_stft[..., 0] + x_stft[..., 1]).sqrt().float()
+        return torch.matmul(spc.transpose(-1, -2), self.mel_basis).clamp(min=self.eps).log10().transpose(-1, -2)[..., :-1]
 
 
 def load_wav(full_path):
@@ -108,13 +160,15 @@ class MelDataset(torch.utils.data.Dataset):
         self.fine_tuning = fine_tuning
         self.base_mels_path = base_mels_path
 
+        self.mel_fn = MelSpectrogram()
+
     def __getitem__(self, index):
         filename = self.audio_files[index]
         if self._cache_ref_count == 0:
             audio, sampling_rate = load_wav(filename)
             audio = audio / MAX_WAV_VALUE
-            if not self.fine_tuning:
-                audio = normalize(audio) * 0.95
+            #if not self.fine_tuning:
+            #    audio = normalize(audio) * 0.95
             self.cached_wav = audio
             if sampling_rate != self.sampling_rate:
                 raise ValueError("{} SR doesn't match target {} SR".format(
@@ -136,9 +190,12 @@ class MelDataset(torch.utils.data.Dataset):
                 else:
                     audio = torch.nn.functional.pad(audio, (0, self.segment_size - audio.size(1)), 'constant')
 
-            mel = mel_spectrogram(audio, self.n_fft, self.num_mels,
-                                  self.sampling_rate, self.hop_size, self.win_size, self.fmin, self.fmax,
-                                  center=False)
+            mel = self.mel_fn(audio)
+            #mel = mel_spectrogram(audio, self.n_fft, self.num_mels,
+            #                      self.sampling_rate, self.hop_size, self.win_size, self.fmin, self.fmax,
+            #                      center=False)
+
+        # we are not fine tuning now - leave as is
         else:
             mel = np.load(
                 os.path.join(self.base_mels_path, os.path.splitext(os.path.split(filename)[-1])[0] + '.npy'))
